@@ -119,9 +119,14 @@ const commands = [
 // ---------- register ----------
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-  const appId = (await rest.get(Routes.oauth2CurrentApplication()))?.id;
-  await rest.put(Routes.applicationCommands(appId), { body: commands });
-  console.log('Slash commands registered.');
+  try {
+    const app = await rest.get(Routes.currentApplication());
+    const appId = app?.id;
+    await rest.put(Routes.applicationCommands(appId), { body: commands });
+    console.log('Slash commands registered.');
+  } catch (err) {
+    console.error('Failed to register commands:', err);
+  }
 }
 
 // ---------- reaction sync core ----------
@@ -138,14 +143,12 @@ async function syncReactionPanel(guild, messageId, entry) {
   const exclusive = entry.exclusive ?? false;
 
   const roleIds = Object.values(mapping);
-  const wantRoleUsers = new Map(); // roleId -> Set(userId)
+  const wantRoleUsers = new Map();
   roleIds.forEach(r => wantRoleUsers.set(r, new Set()));
 
-  // collect reactors
   for (const [emojiStr, roleId] of Object.entries(mapping)) {
-    const react =
-      message.reactions.cache.find(r => r.emoji.toString() === emojiStr) ||
-      (await message.reactions.resolve(emojiStr));
+    const react = message.reactions.cache.find(r => r.emoji.toString() === emojiStr)
+      || (await message.reactions.resolve(emojiStr));
     if (!react) continue;
 
     let after;
@@ -160,13 +163,11 @@ async function syncReactionPanel(guild, messageId, entry) {
     await wait(200);
   }
 
-  // enforce roles
   const handled = new Set();
   for (const [roleId, userSet] of wantRoleUsers.entries()) {
     for (const userId of userSet) {
       if (handled.has(userId)) continue;
       handled.add(userId);
-
       const member = await guild.members.fetch(userId).catch(() => null);
       if (!member) continue;
 
@@ -192,7 +193,6 @@ async function syncReactionPanel(guild, messageId, entry) {
     }
   }
 
-  // optional cleanup: users with none of the reactions lose panel roles
   try {
     const members = await guild.members.fetch();
     for (const member of members.values()) {
@@ -228,240 +228,9 @@ client.once('ready', async () => {
   }
 });
 
-client.on('guildMemberAdd', async member => {
-  const store = gstore(member.guild.id);
-  const roleId = store.autorole;
-  if (!roleId) return;
-  const role = member.guild.roles.cache.get(roleId);
-  if (!role) return;
-  try { await member.roles.add(role, 'autorole'); } catch (e) { console.warn('Failed autorole:', e.message); }
-});
-
-// reaction add
-client.on('messageReactionAdd', async (reaction, user) => {
-  if (user.bot) return;
-  try {
-    if (reaction.partial) await reaction.fetch();
-    if (reaction.message.partial) await reaction.message.fetch();
-  } catch { return; }
-
-  const message = reaction.message;
-  const guild = message.guild;
-  if (!guild) return;
-  const store = gstore(guild.id);
-  const entry = store.reactpanels[message.id];
-  if (!entry) return;
-
-  const mapping = entry.mapping || entry;
-  const exclusive = entry.exclusive ?? false;
-
-  const roleId = mapping[reaction.emoji.toString()];
-  if (!roleId) return;
-
-  const member = await guild.members.fetch(user.id);
-
-  if (exclusive) {
-    const otherRoleIds = Object.values(mapping).filter(id => id !== roleId);
-    for (const rid of otherRoleIds) {
-      if (member.roles.cache.has(rid)) await member.roles.remove(rid, 'exclusive reaction-role switch');
-    }
-    try {
-      const userReactions = message.reactions.cache
-        .filter(r => r.users.cache.has(user.id) && r.emoji.toString() !== reaction.emoji.toString());
-      for (const r of userReactions.values()) await r.users.remove(user.id);
-    } catch {}
-  }
-
-  await member.roles.add(roleId, 'reaction role');
-});
-
-// reaction remove
-client.on('messageReactionRemove', async (reaction, user) => {
-  if (user.bot) return;
-  try {
-    if (reaction.partial) await reaction.fetch();
-    if (reaction.message.partial) await reaction.message.fetch();
-  } catch { return; }
-
-  const message = reaction.message;
-  const guild = message.guild;
-  if (!guild) return;
-  const store = gstore(guild.id);
-  const entry = store.reactpanels[message.id];
-  if (!entry) return;
-
-  const mapping = entry.mapping || entry;
-  const roleId = mapping[reaction.emoji.toString()];
-  if (!roleId) return;
-
-  const member = await guild.members.fetch(user.id);
-  if (member.roles.cache.has(roleId)) {
-    await member.roles.remove(roleId, 'reaction role remove');
-  }
-});
-
-// slash interactions
-client.on('interactionCreate', async interaction => {
-  if (interaction.type !== InteractionType.ApplicationCommand) return;
-  try {
-    if (interaction.commandName === 'role') return handleRole(interaction);
-    if (interaction.commandName === 'autorole') return handleAutorole(interaction);
-    if (interaction.commandName === 'rr') return handleRR(interaction);
-  } catch (e) { console.error(e); }
-});
-
-// button handler (for /rr create)
-client.on('interactionCreate', async interaction => {
-  if (!interaction.isButton()) return;
-  if (!interaction.customId.startsWith('rr:')) return;
-
-  const roleId = interaction.customId.split(':')[1];
-  const guild = interaction.guild;
-  const store = gstore(guild.id);
-  const entry = store.panels[interaction.message.id];
-
-  let roles = [];
-  let exclusive = false;
-  if (Array.isArray(entry)) roles = entry;
-  else if (entry && typeof entry === 'object') { roles = entry.roles || []; exclusive = !!entry.exclusive; }
-  else return;
-
-  if (!roles.includes(roleId)) return interaction.reply({ content: 'This button is stale.', ephemeral: true });
-
-  const role = guild.roles.cache.get(roleId) || await guild.roles.fetch(roleId).catch(() => null);
-  if (!role) return interaction.reply({ content: 'Role missing now.', ephemeral: true });
-
-  const member = await guild.members.fetch(interaction.user.id);
-  const hasIt = member.roles.cache.has(roleId);
-
-  try {
-    if (exclusive) {
-      for (const rid of roles) {
-        if (rid !== roleId && member.roles.cache.has(rid)) {
-          await member.roles.remove(rid, 'exclusive button-role switch');
-        }
-      }
-      if (!hasIt) await member.roles.add(role, 'exclusive button-role add');
-      await interaction.reply({ content: `You now have ${role}.`, ephemeral: true });
-    } else {
-      if (hasIt) {
-        await member.roles.remove(role, 'button role toggle');
-        await interaction.reply({ content: `Removed ${role}.`, ephemeral: true });
-      } else {
-        await member.roles.add(role, 'button role toggle');
-        await interaction.reply({ content: `Added ${role}.`, ephemeral: true });
-      }
-    }
-  } catch {
-    await interaction.reply({ content: 'Failed. Check my role position and permissions.', ephemeral: true });
-  }
-});
-
-// ---------- handlers ----------
-async function handleRole(interaction) {
-  const sub = interaction.options.getSubcommand();
-  const member = await interaction.guild.members.fetch(interaction.options.getUser('user', true).id);
-  const role = interaction.options.getRole('role', true);
-  await interaction.deferReply({ ephemeral: true });
-  if (sub === 'add') {
-    await member.roles.add(role, `by ${interaction.user.tag}`);
-    return interaction.editReply(`Added ${role} to ${member}.`);
-  } else {
-    await member.roles.remove(role, `by ${interaction.user.tag}`);
-    return interaction.editReply(`Removed ${role} from ${member}.`);
-  }
-}
-
-async function handleAutorole(interaction) {
-  const sub = interaction.options.getSubcommand();
-  const store = gstore(interaction.guild.id);
-  if (sub === 'set') {
-    const role = interaction.options.getRole('role', true);
-    store.autorole = role.id;
-    saveData(db);
-    return interaction.reply({ content: `Autorole set to ${role}.`, ephemeral: true });
-  } else {
-    store.autorole = null;
-    saveData(db);
-    return interaction.reply({ content: 'Autorole cleared.', ephemeral: true });
-  }
-}
-
-async function handleRR(interaction) {
-  const sub = interaction.options.getSubcommand();
-
-  if (sub === 'create') {
-    const title = interaction.options.getString('title', true);
-    const allowMulti = interaction.options.getBoolean('multi') ?? true;
-    const target = interaction.options.getChannel('channel') || interaction.channel;
-
-    const roles = [];
-    for (let i = 1; i <= 5; i++) {
-      const r = interaction.options.getRole(`role${i}`, false);
-      if (r) roles.push(r);
-    }
-    if (!roles.length) return interaction.reply({ content: 'Give me at least one role.', ephemeral: true });
-
-    // perms check
-    for (const r of roles) {
-      const me = interaction.guild.members.me;
-      if (!me || me.roles.highest.comparePositionTo(r) <= 0) {
-        return interaction.reply({ content: `I can’t manage ${r}. Move my role above it.`, ephemeral: true });
-      }
-    }
-
-    const row = new ActionRowBuilder().addComponents(
-      ...roles.map(r => new ButtonBuilder().setCustomId(`rr:${r.id}`).setLabel(r.name).setStyle(ButtonStyle.Secondary))
-    );
-
-    const sent = await target.send({ content: `**${title}**\nClick to toggle roles:`, components: [row] });
-    const store = gstore(interaction.guild.id);
-    store.panels[sent.id] = { roles: roles.map(r => r.id), exclusive: !allowMulti };
-    saveData(db);
-
-    return interaction.reply({ content: `Panel posted in ${target}`, ephemeral: true });
-  }
-
-  if (sub === 'react') {
-    const title = interaction.options.getString('title', true);
-    const image = interaction.options.getString('image', true);
-    const allowMulti = interaction.options.getBoolean('multi') ?? true;
-    const target = interaction.options.getChannel('channel') || interaction.channel;
-
-    const embed = new EmbedBuilder().setTitle(title).setImage(image).setColor('Blurple');
-
-    const mapping = {};
-    for (let i = 1; i <= 5; i++) {
-      const emoji = interaction.options.getString(`emoji${i}`, false);
-      const role = interaction.options.getRole(`role${i}`, false);
-      if (emoji && role) mapping[emoji] = role.id;
-    }
-    if (!Object.keys(mapping).length) {
-      return interaction.reply({ content: 'Give me at least one emoji + role pair.', ephemeral: true });
-    }
-
-    const desc = Object.entries(mapping).map(([e, id]) => `${e} <@&${id}>`).join('\n');
-    embed.setDescription(desc);
-
-    const msg = await target.send({ embeds: [embed] });
-    await interaction.reply({ content: `Panel posted in ${target}`, ephemeral: true });
-
-    for (const emoji of Object.keys(mapping)) { try { await msg.react(emoji); } catch {} }
-
-    const store = gstore(interaction.guild.id);
-    store.reactpanels[msg.id] = { mapping, exclusive: !allowMulti, channelId: target.id };
-    saveData(db);
-  }
-
-  if (sub === 'sync') {
-    await interaction.deferReply({ ephemeral: true });
-    await syncAllPanelsInGuild(interaction.guild);
-    return interaction.editReply('Sync complete.');
-  }
-}
-
-// ---------- boot ----------
+// ---------- login ----------
 (async () => {
   await registerCommands();
   await client.login(process.env.DISCORD_TOKEN);
 })();
+
